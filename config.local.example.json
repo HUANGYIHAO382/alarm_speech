@@ -1,8 +1,8 @@
 {
   "tts": {
     "moss": {
-      "python": "e:/alarm_speech/moss_env/Scripts/python.exe",
-      "repo_dir": "e:/alarm_speech/third_party/MOSS-TTS-Nano",
+      "python": "",
+      "repo_dir": "",
       "backend": "onnx",
       "voice": "Junhao",
       "prompt_audio_path": "",

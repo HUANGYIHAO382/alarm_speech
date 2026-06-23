@@ -16,6 +16,38 @@
 
 ## 安装
 
+### 一键安装（推荐，clone 后执行）
+
+```powershell
+cd alarm_speech
+.\setup_all.ps1 -UseMirror    # 国内用户建议加 -UseMirror 加速模型下载
+.\run.ps1
+```
+
+`setup_all.ps1` 会自动完成：
+
+1. 创建 `alarm_env` 并安装主程序依赖
+2. 创建 `moss_env`、克隆 MOSS 源码
+3. 从 Hugging Face 预下载约 1GB ONNX 模型
+4. 从模板生成 `config.local.json`
+
+可选参数：
+
+| 参数 | 说明 |
+|------|------|
+| `-UseMirror` | 使用国内 HF 镜像（hf-mirror.com） |
+| `-SkipMoss` | 不装 MOSS（仅用 Windows SAPI / 讯飞） |
+| `-SkipModels` | 装环境但不预下载模型 |
+| `-WithGpu` | 安装 NVIDIA GPU 加速（约 1.5GB 额外下载） |
+
+单独重试模型下载：
+
+```powershell
+.\moss_env\Scripts\python.exe download_moss_models.py --mirror
+```
+
+### 分步安装
+
 本项目使用**两个独立虚拟环境**，所有依赖只装在项目文件夹内，**不会修改你系统里的 Python 或全局 pip**：
 
 | 虚拟环境 | 用途 | Python 要求 |
@@ -129,7 +161,7 @@ pip install -r requirements.txt
 | 语音 | `tts_engine.py`、`tts_config.py`、`moss_tts.py`、`moss_daemon.py` |
 | MOSS/GPU | `moss_cuda_env.py`、`moss_cuda_probe.py`、`fix_moss_gpu.ps1` |
 | 日志 | `app_logger.py` → `logs/` |
-| 安装 | `setup.ps1`、`setup_moss.ps1`、`run.ps1` |
+| 安装 | `setup_all.ps1`（一键）、`setup.ps1`、`setup_moss.ps1`、`download_moss_models.py`、`run.ps1` |
 | 文档 | `docs/`（含 UI 方案、MOSS 缓存拼合方案） |
 
 ## 许可证
