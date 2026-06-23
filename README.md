@@ -6,7 +6,7 @@
 
 - 从监控平台拉取告警历史与活跃告警
 - 定时轮询，自动检测新增 / 恢复事件
-- 支持 Windows 本地 TTS 与科大讯飞在线 TTS
+- 支持 Windows 本地 TTS、MOSS-TTS-Nano 本地模型与科大讯飞在线 TTS
 - 多种播报规则（通用、端口表、自动匹配）
 
 ## 环境要求
@@ -16,16 +16,34 @@
 
 ## 安装
 
-```bash
-# 1. 克隆仓库
-git clone https://github.com/HUANGYIHA0382/alarm_speech.git
-cd alarm_speech
+本项目使用**两个独立虚拟环境**，所有依赖只装在项目文件夹内，**不会修改你系统里的 Python 或全局 pip**：
 
-# 2. 创建虚拟环境 (推荐)
-python -m venv alarm_env
+| 虚拟环境 | 用途 | Python 要求 |
+|---------|------|------------|
+| `alarm_env` | 主程序 Flet 界面 | 3.8+（可用你现有的 3.9） |
+| `moss_env` | MOSS 语音模型（可选） | 3.10+（需额外安装 3.12，与 3.9 并存） |
+
+```powershell
+cd e:\alarm_speech
+
+# 一键安装主程序环境（推荐）
+.\setup.ps1
+
+# 若还需要 MOSS 语音，先安装 Python 3.12（多装一个版本，不覆盖原环境）:
+# winget install Python.Python.3.12
+# 然后:
+.\setup.ps1 -WithMoss
+# 或单独: .\setup_moss.ps1
+
+# 启动程序（始终走 alarm_env，不用系统 python）
+.\run.ps1
+```
+
+手动方式（与上面等价）：
+
+```powershell
+python -m venv alarm_env          # 不推荐直接用系统 python，请用 setup_alarm.ps1
 alarm_env\Scripts\activate
-
-# 3. 安装依赖
 pip install -r requirements.txt
 ```
 
@@ -60,22 +78,59 @@ pip install -r requirements.txt
 
 未配置时自动使用 Windows 本地语音。
 
+### 3. MOSS-TTS-Nano 本地模型（可选，推荐）
+
+[MOSS-TTS-Nano](https://github.com/OpenMOSS/MOSS-TTS-Nano) 是 OpenMOSS 开源的中文语音模型，CPU 即可运行，音质优于系统 SAPI。
+
+**注意：** MOSS 需要 **Python 3.10+**（推荐 3.12），与主程序 `alarm_env` 分开安装；`winget install Python.Python.3.12` 是**多装一个版本**，不会覆盖你现有的 Python 3.9。
+
+```powershell
+.\setup_moss.ps1
+# 或: .\setup.ps1 -WithMoss
+
+.\alarm_env\Scripts\python.exe test_moss_tts.py
+```
+
+安装完成后，在界面「语音引擎」中选择 **MOSS 本地** 即可。
+
+可选配置 `config.local.json`（参考 `config.local.example.json`）：
+
+```json
+{
+  "tts": {
+    "moss": {
+      "voice": "Junhao",
+      "cpu_threads": 4
+    }
+  }
+}
+```
+
 ## 运行
 
-```bash
-python flet_demo.py
+```powershell
+.\run.ps1
+```
+
+或：
+
+```powershell
+.\alarm_env\Scripts\python.exe flet_demo.py
 ```
 
 ## 项目结构
 
-| 文件 | 说明 |
-|------|------|
-| `flet_demo.py` | UI 入口 |
-| `api_client.py` | 告警 API 网络层 |
-| `alarm_processor.py` | 告警清洗、追踪、播报规则 |
-| `tts_engine.py` | TTS 引擎调度 |
-| `xfyun_tts.py` | 讯飞 WebSocket TTS |
-| `tts_config.py` | 配置加载 |
+详细目录说明见 **[docs/项目结构.md](docs/项目结构.md)**；文档索引见 **[docs/README.md](docs/README.md)**。
+
+| 类别 | 主要文件 |
+|------|----------|
+| UI | `flet_demo.py` |
+| 告警 | `api_client.py`、`alarm_processor.py` |
+| 语音 | `tts_engine.py`、`tts_config.py`、`moss_tts.py`、`moss_daemon.py` |
+| MOSS/GPU | `moss_cuda_env.py`、`moss_cuda_probe.py`、`fix_moss_gpu.ps1` |
+| 日志 | `app_logger.py` → `logs/` |
+| 安装 | `setup.ps1`、`setup_moss.ps1`、`run.ps1` |
+| 文档 | `docs/`（含 UI 方案、MOSS 缓存拼合方案） |
 
 ## 许可证
 

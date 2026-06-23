@@ -1,8 +1,9 @@
 """
 语音播报模块 (TTS Engine)
 ============================
-支持两种引擎 (界面下拉切换):
+支持三种引擎 (界面下拉切换):
     - xfyun  : 科大讯飞 WebSocket API (需联网 + config.local.json 密钥)
+    - moss   : MOSS-TTS-Nano 本地 ONNX (需 setup_moss.ps1 安装)
     - local  : Windows 离线 SAPI (win32com -> pyttsx3 -> PowerShell 兜底)
 """
 
@@ -15,15 +16,23 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
-from tts_config import create_xfyun_client, get_xfyun_settings, load_merged_config
+from tts_config import (
+    create_moss_client,
+    create_xfyun_client,
+    get_xfyun_settings,
+    is_moss_configured,
+    load_merged_config,
+)
 
 BACKEND_XFYUN = "xfyun"
+BACKEND_MOSS = "moss"
 BACKEND_LOCAL = "local"
 
 BACKEND_LABELS = {
     BACKEND_XFYUN: "讯飞在线",
+    BACKEND_MOSS: "MOSS 本地",
     BACKEND_LOCAL: "Windows SAPI 离线",
 }
 
@@ -34,7 +43,11 @@ def is_xfyun_configured() -> bool:
 
 
 def default_backend_mode() -> str:
-    return BACKEND_XFYUN if is_xfyun_configured() else BACKEND_LOCAL
+    if is_xfyun_configured():
+        return BACKEND_XFYUN
+    if is_moss_configured():
+        return BACKEND_MOSS
+    return BACKEND_LOCAL
 
 
 class TTSEngine:
@@ -48,7 +61,11 @@ class TTSEngine:
         self._last_error: str = ""
 
         self._xfyun_client = None
+        self._moss_client = None
         self._backend_mode = default_backend_mode()
+        self._moss_provider_override: Optional[str] = None
+        self._moss_cpu_threads_override: Optional[int] = None
+        self._progress_callback: Optional[Callable[[str, float, str], None]] = None
         # SAPI Rate 范围 -10(最慢) ~ 10(最快), 默认 -3 略慢于系统默认
         self._local_sapi_rate = -4
 
@@ -76,13 +93,102 @@ class TTSEngine:
 
     def speak_local(self, text: str) -> None:
         """
-        强制 Windows SAPI 离线播报（UI 试听专用）。
+        强制 Windows SAPI 离线播报（兼容旧接口）。
         不受「语音引擎」下拉框影响，不受「语音播报」开关限制。
         """
         text = self._prepare_text_for_tts(text)
         if not text:
             return
         self._queue.put(("__force_local__", text))
+
+    def speak_preview(self, text: str) -> None:
+        """
+        试听当前选中的语音引擎。
+        不受「语音播报」开关限制，不做去重。
+        """
+        text = self._prepare_text_for_tts(text)
+        if not text:
+            return
+        self._queue.put(text)
+
+    def speak_preview_blocking(self, text: str) -> str:
+        """
+        试听并阻塞直到完成（用于 UI 进度条）。
+        返回空字符串表示成功，否则为错误信息。
+        """
+        text = self._prepare_text_for_tts(text)
+        if not text:
+            return "内容为空"
+
+        try:
+            mode = self.get_backend()
+            if mode == BACKEND_XFYUN:
+                err = self._ensure_xfyun()
+                if err:
+                    return err
+                self._speak_xfyun(text)
+            elif mode == BACKEND_MOSS:
+                err = self._ensure_moss()
+                if err:
+                    return err
+                self._speak_moss(text)
+            else:
+                local_backend, speaker, engine = self._init_local_backend()
+                self._speak_local(local_backend, speaker, engine, text)
+            self._last_error = ""
+            return ""
+        except Exception as err:
+            self._last_error = str(err)
+            try:
+                from app_logger import get_logger
+                get_logger("tts").exception("试听失败: %s", err)
+            except ImportError:
+                pass
+            return str(err)
+
+    def set_progress_callback(
+        self, callback: Optional[Callable[[str, float, str], None]]
+    ) -> None:
+        """设置 MOSS 合成进度回调: (阶段, 已用秒数, 说明)。"""
+        self._progress_callback = callback
+
+    def set_moss_execution_provider(self, provider: str) -> str:
+        """
+        切换 MOSS 运行设备 cpu / cuda。返回空字符串表示成功。
+        会重启 MOSS 守护进程使新模式生效。
+        """
+        provider = (provider or "").strip().lower()
+        if provider not in ("cpu", "cuda"):
+            return f"未知 MOSS 设备模式: {provider}"
+
+        self._moss_provider_override = provider
+        if self._moss_client is not None:
+            self._moss_client.shutdown_daemon()
+            self._moss_client = None
+        self._last_error = ""
+        return ""
+
+    def get_moss_execution_provider(self) -> str:
+        if self._moss_provider_override:
+            return self._moss_provider_override
+        from tts_config import get_moss_settings
+        return get_moss_settings().get("execution_provider", "cpu")
+
+    def set_moss_cpu_threads(self, threads: int) -> str:
+        """纯 CPU 模式下 ONNX 算子内并行线程数；变更后重启守护进程。"""
+        threads = max(1, int(threads))
+        self._moss_cpu_threads_override = threads
+        if self._moss_client is not None:
+            self._moss_client.shutdown_daemon()
+            self._moss_client = None
+        self._last_error = ""
+        return ""
+
+    def get_moss_cpu_threads(self) -> int:
+        if self._moss_cpu_threads_override is not None:
+            return self._moss_cpu_threads_override
+        from tts_config import get_moss_settings
+        return int(get_moss_settings().get("cpu_threads", 4))
 
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = enabled
@@ -111,6 +217,11 @@ class TTSEngine:
 
         if mode == BACKEND_XFYUN:
             err = self._ensure_xfyun()
+            if err:
+                return err
+
+        if mode == BACKEND_MOSS:
+            err = self._ensure_moss()
             if err:
                 return err
 
@@ -158,6 +269,29 @@ class TTSEngine:
         except Exception as err:
             return f"讯飞初始化失败: {err}"
 
+    def _ensure_moss(self) -> str:
+        """确保 MOSS 客户端可用, 失败返回错误信息。"""
+        if self._moss_client is not None:
+            return ""
+        if not is_moss_configured():
+            return (
+                "MOSS 未安装: 请在项目根目录运行 setup_moss.ps1，"
+                "或配置 config.local.json 中的 tts.moss"
+            )
+        try:
+            from tts_config import create_moss_client
+
+            self._moss_client = create_moss_client(
+                execution_provider=self.get_moss_execution_provider(),
+                cpu_threads=self.get_moss_cpu_threads(),
+            )
+            ok, err = self._moss_client.is_ready()
+            if not ok:
+                return err
+            return ""
+        except Exception as err:
+            return f"MOSS 初始化失败: {err}"
+
     # ---------- 内部: 后台消费 ----------
     def _run(self) -> None:
         local_backend, speaker, engine = self._init_local_backend()
@@ -183,11 +317,21 @@ class TTSEngine:
                         if err:
                             raise RuntimeError(err)
                         self._speak_xfyun(text)
+                    elif mode == BACKEND_MOSS:
+                        err = self._ensure_moss()
+                        if err:
+                            raise RuntimeError(err)
+                        self._speak_moss(text)
                     else:
                         self._speak_local(local_backend, speaker, engine, text)
                 self._last_error = ""
             except Exception as err:
                 self._last_error = str(err)
+                try:
+                    from app_logger import get_logger
+                    get_logger("tts").exception("TTS 播报失败: %s", err)
+                except ImportError:
+                    pass
 
     def _speak_local(self, local_backend, speaker, engine, text: str) -> None:
         rate = self._local_sapi_rate
@@ -203,6 +347,18 @@ class TTSEngine:
 
     def _speak_xfyun(self, text: str) -> None:
         wav_bytes = self._xfyun_client.synthesize_for_playback(text)
+        self._play_wav_bytes(wav_bytes)
+
+    def _speak_moss(self, text: str) -> None:
+        wav_bytes = self._moss_client.synthesize_for_playback(
+            text,
+            progress=self._progress_callback,
+        )
+        self._play_wav_bytes(wav_bytes)
+
+    @staticmethod
+    def _play_wav_bytes(wav_bytes: bytes) -> None:
+        """将 WAV 字节写入临时文件并用 winsound 播放。"""
         fd, path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
         try:

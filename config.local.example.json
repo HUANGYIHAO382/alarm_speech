@@ -1,0 +1,20 @@
+{
+  "tts": {
+    "moss": {
+      "python": "e:/alarm_speech/moss_env/Scripts/python.exe",
+      "repo_dir": "e:/alarm_speech/third_party/MOSS-TTS-Nano",
+      "backend": "onnx",
+      "voice": "Junhao",
+      "prompt_audio_path": "",
+      "model_dir": "",
+      "cpu_threads": 4,
+      "execution_provider": "cpu"
+    },
+    "xfyun": {
+      "app_id": "",
+      "api_key": "",
+      "api_secret": "",
+      "vcn": "xiaoyan"
+    }
+  }
+}

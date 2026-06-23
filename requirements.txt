@@ -1,3 +1,6 @@
 flet>=0.25.0
 requests>=2.28.0
 websocket-client>=1.6.0
+# Windows 本地 SAPI 语音（仅装进 alarm_env，不影响系统 Python）
+pywin32>=306
+pyttsx3>=2.90
