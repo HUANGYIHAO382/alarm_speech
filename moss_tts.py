@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -70,6 +71,21 @@ class MossTtsClient:
             return False, "未找到 moss-tts-nano，请运行 setup_moss.ps1"
         return True, ""
 
+    def is_daemon_alive(self) -> bool:
+        """守护进程是否已在运行且模型已加载。"""
+        proc = MossTtsClient._daemon_proc
+        if proc is None or proc.poll() is not None:
+            return False
+        try:
+            resp = requests.get(f"{self._base_url()}/health", timeout=2)
+            return bool(resp.json().get("ok"))
+        except requests.RequestException:
+            return False
+
+    def warmup_daemon(self, progress: Optional[ProgressCallback] = None) -> None:
+        """仅启动守护进程并加载模型，不执行合成。"""
+        self._ensure_daemon(progress=progress)
+
     def synthesize_for_playback(
         self,
         text: str,
@@ -115,14 +131,45 @@ class MossTtsClient:
     ) -> bytes:
         self._ensure_daemon(progress=progress)
         if progress:
-            progress("synthesize", 0.0, "提交合成任务...")
+            progress("synthesize", 0.0, "提交合成任务")
 
         t0 = time.perf_counter()
-        resp = requests.post(
-            f"{self._base_url()}/synthesize",
-            json={"text": text, "voice": self._voice},
-            timeout=300,
-        )
+        result: dict = {}
+        error: dict = {}
+
+        def _post() -> None:
+            try:
+                result["resp"] = requests.post(
+                    f"{self._base_url()}/synthesize",
+                    json={"text": text, "voice": self._voice},
+                    timeout=300,
+                )
+            except Exception as err:
+                error["err"] = err
+
+        # HTTP 阻塞期间轮询 /status，让进度条能持续刷新已用时
+        worker = threading.Thread(target=_post, daemon=True)
+        worker.start()
+        while worker.is_alive():
+            elapsed = time.perf_counter() - t0
+            if progress:
+                status_msg = "语音合成中"
+                try:
+                    st = requests.get(f"{self._base_url()}/status", timeout=1).json()
+                    if st.get("phase") == "synthesize":
+                        status_msg = str(st.get("message") or status_msg)
+                except requests.RequestException:
+                    pass
+                progress("synthesize", elapsed, status_msg)
+            worker.join(timeout=0.35)
+
+        if error.get("err"):
+            raise error["err"]
+
+        resp = result.get("resp")
+        if resp is None:
+            raise RuntimeError("守护进程合成无响应")
+
         elapsed = time.perf_counter() - t0
 
         if resp.status_code != 200:
@@ -133,8 +180,8 @@ class MossTtsClient:
             raise RuntimeError(data.get("error") or "合成失败")
 
         if progress:
-            ms = data.get("elapsed_ms", int(elapsed * 1000))
-            progress("done", elapsed, f"完成 {ms} ms")
+            synth_ms = int(data.get("elapsed_ms", int(elapsed * 1000)))
+            progress("done", elapsed, f"合成完成（推理 {synth_ms} ms）")
 
         return base64.b64decode(data["wav_b64"])
 

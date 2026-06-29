@@ -268,6 +268,29 @@ def get_moss_settings(config: dict | None = None) -> dict:
         "cpu_threads": int(moss.get("cpu_threads", 4)),
         "execution_provider": default_moss_execution_provider(cfg),
         "daemon_port": int(moss.get("daemon_port", 18764)),
+        # 是否在后台常驻 MOSS 模型（界面勾选「启动时预热模型」也会覆盖此项）
+        "prewarm": bool(moss.get("prewarm", False)),
+    }
+
+
+def get_cache_settings(config: dict | None = None) -> dict:
+    """
+    读取 MOSS 语音缓存配置（alarm_speech.cache）。
+    默认值与 docs/UI优化方案.md §8.4 对齐。
+    """
+    cfg = config if config is not None else load_merged_config()
+    alarm = cfg.get("alarm_speech") or {}
+    cache = alarm.get("cache") or {}
+    return {
+        "enabled": bool(cache.get("enabled", True)),
+        "stitch_enabled": bool(cache.get("stitch_enabled", True)),
+        "stitch_silence_ms": int(cache.get("stitch_silence_ms", 80)),
+        "max_disk_mb": int(cache.get("max_disk_mb", 500)),
+        "max_entries": int(cache.get("max_entries", 500)),
+        "auto_lru_at_percent": int(cache.get("auto_lru_at_percent", 90)),
+        "history_fetch_default": int(cache.get("history_fetch_default", 500)),
+        "auto_synthesize_after_history": bool(cache.get("auto_synthesize_after_history", False)),
+        "panel_collapsed": bool(cache.get("panel_collapsed", False)),
     }
 
 

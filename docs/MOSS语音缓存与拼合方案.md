@@ -1,7 +1,9 @@
 # MOSS 本地语音 — 缓存与拼合加速方案
 
-> 文档版本：2026-06-23 v4（含 §4.3–4.4 全方案耗时对比）
+> 文档版本：2026-06-23 v4（含 §4.3–4.4 全方案耗时对比）  
+> **2026-06-29 增补**：§5.5 符号读法、§5.6 热词表模型、§5.7 存储配额、§6 历史拉取细化  
 > 适用场景：`alarm_speech` 使用 **MOSS 本地** 引擎时的告警播报性能优化  
+> UI 设计：[UI优化方案 v6.1](./UI优化方案.md)  
 > 状态：**方案设计**（尚未编码实现）
 
 ---
@@ -339,9 +341,145 @@ cache/index.json        # key → path, hit_count, last_used, duration_ms
 
 保证 **功能正确优先于性能**。
 
+### 5.5 文本规范化与符号读法（缓存 Key 前置条件）
+
+> UI 见 [UI优化方案 §5.5](./UI优化方案.md)；配置存 `cache/symbol_rules.json`。
+
+#### 5.5.1 为什么必须独立成配置
+
+缓存 Key 使用 `text_normalized`（§5.2）。若符号读法仅硬编码在 `alarm_processor.py`：
+
+- 用户无法扩展 `/`、`#` 等读法  
+- 手动热词 `NE20E-1` 与规范化后 `NE20E杠1` 可能生成 **两条 WAV**  
+- 历史分析与播报润色 **规则不一致** 会导致命中率下降  
+
+#### 5.5.2 规范化流水线
+
+```
+原始文本 (raw)
+    │
+    ▼
+apply_device_patterns()     # B05_NE20E-1 → B05柜，NE20E-1
+    │
+    ▼
+apply_char_rules()          # - → 杠, / → 斜杠（可配置）
+    │
+    ▼
+apply_word_rules()          # up→联通, down→中断
+    │
+    ▼
+polish_whitespace()         # 去多余空格、统一逗号
+    │
+    ▼
+text_normalized  →  cache_key / 热词表「词组」列 / MOSS 合成输入
+```
+
+#### 5.5.3 默认规则（与现网 `alarm_processor` 对齐）
+
+| 类型 | 规则 | 示例 |
+|------|------|------|
+| 字符 | `-` → `杠` | `NE20E-1` → `NE20E杠1` |
+| 设备 | `^([A-Za-z]\d+)_(.+)$` | `B05_NE20E-1` → `B05柜，NE20E杠1` |
+| 状态词 | `up` → `联通` | `端口 up` → `端口，联通` |
+| 状态词 | `down` → `中断` | |
+
+#### 5.5.4 实现模块（待编码）
+
+```python
+# tts_normalize.py（建议新建）
+def normalize_for_cache(text: str, rules: SymbolRules | None = None) -> str: ...
+def preview_normalize(text: str) -> tuple[str, list[str]]: ...  # 供 UI 预览
+```
+
+`alarm_processor.polish_speech_for_tts` 逐步改为调用 `normalize_for_cache`，避免双份逻辑。
+
+#### 5.5.5 规则变更与已有 WAV
+
+| 策略 | 说明 |
+|------|------|
+| 默认 | 旧 Key 不变；新规则仅作用于新热词 |
+| 用户确认「全量重制」 | 所有条目标 `pending`，保留旧 WAV 至 LRU 清理 |
+
 ---
 
-## 五-B、流式合成与播放同步（CPU 防卡顿）
+### 5.6 热词表数据模型（UI 与后端共用）
+
+> 单条热词 = 计划缓存或已制作的 **片段文本**；UI 表格一行对应一条。
+
+#### 5.6.1 状态机
+
+```
+pending ──(WarmupJob)──► synthesizing ──► ready
+   │                         │
+   │                         └──► failed ──(retry)──► synthesizing
+   └──(delete)──► (removed)
+```
+
+| status | UI 文案 | 磁盘有 WAV |
+|--------|---------|------------|
+| `pending` | 待制作 | 否 |
+| `synthesizing` | 制作中 | 否 |
+| `ready` | 已制作 | 是 |
+| `failed` | 失败 | 否 |
+
+#### 5.6.2 来源 `source`
+
+| 值 | 含义 | 写入方式 |
+|----|------|----------|
+| `system` | Tier-0 固定词 | 安装/「预热固定词」 |
+| `history` | 历史词频 | 「从历史生成热词」 |
+| `manual` | 用户手动 | 手动添加区 |
+| `runtime` | 运行时 MISS 自动入库 | 播报补制作 |
+
+#### 5.6.3 合并去重 Key
+
+```
+unique_key = normalize_for_cache(text)
+```
+
+同 Key 已存在时：更新 `history_count`，不新增行；`manual` 来源可设 `pinned: true`。
+
+---
+
+### 5.7 存储配额与 LRU
+
+#### 5.7.1 统计项
+
+| 指标 | 计算 |
+|------|------|
+| `disk_used_bytes` | `sum(entry.file_size)` + 索引文件 |
+| `entry_count` | `index.entries` 长度 |
+| `ready_count` | status=ready |
+
+定时刷新（30s）+ 每次 WarmupJob 条目完成时刷新。
+
+#### 5.7.2 上限（默认）
+
+| 配置项 | 默认 | 说明 |
+|--------|------|------|
+| `max_disk_mb` | 500 | UI 可调 |
+| `max_entries` | 500 | 热词条数上限 |
+| `auto_lru_at_percent` | 90 | 触发 LRU |
+
+#### 5.7.3 LRU 淘汰顺序
+
+1. **永不淘汰**：`source=system`（固定词）  
+2. **其次淘汰**：`hit_count` 最低、`last_used_at` 最旧  
+3. **保留**：`pinned=true`（手动置顶）
+
+#### 5.7.4 预合成前空间校验
+
+```python
+def can_import_hotwords(new_entries: list, stats: CacheStats) -> tuple[bool, str]:
+    estimated_mb = sum(estimate_wav_size(e.text) for e in new_entries)
+    if stats.disk_used_mb + estimated_mb > stats.max_disk_mb * 0.95:
+        return False, "剩余空间不足，请清理或提高上限"
+    return True, ""
+```
+
+UI 在历史分析步骤 2 调用，禁用「确认并导入」。
+
+---
 
 > 你提出的问题非常关键：**在 CPU 上若「播放比合成快」，会出现明显卡顿（buffer underrun）**。  
 > 本节说明 MOSS 上游能力、风险边界，以及与本项目「片段缓存 + 拼合」如何配合。
@@ -617,29 +755,65 @@ UI「CPU 并行」下拉
 
 ## 六、历史告警驱动的预热（热度词）
 
-### 6.1 流程
+> **UI 入口**：预缓存面板 `[从历史生成热词]`（见 [UI优化方案 §5.1](./UI优化方案.md)）。
+
+### 6.1 完整流程（拉取 → 分析 → 入库 → 预合成）
 
 ```
-1. 用户点击「分析历史并预热」或 首次启动向导
-2. 拉取最近 N 条历史（如 500–2000）
-3. 对每条告警执行 event_to_speech(rule=当前规则)
-4. 分词/分槽 → 统计 global 词频 + 设备名频次
-5. 生成预热清单：
-   - Tier-0: 固定词（端口、联通、中断、恢复、告警…）
-   - Tier-1: Top 50 机柜名
-   - Tier-2: Top 200 设备名片段
-   - Tier-3: Top 20 完整句式（可选，整句缓存兜底）
-6. 后台队列调用 moss_daemon 批量合成（低优先级，不阻塞实时告警）
-7. 进度：UI 显示「预热 37/250」
+┌─ 用户 ─────────────────────────────────────────────────────────┐
+│  [从历史生成热词] → 选择 N 条 / 规则 → [分析] → 预览 → [导入]   │
+│  可选 □ 分析后自动预合成                                        │
+└────────────────────────────┬───────────────────────────────────┘
+                             ▼
+┌─ HistoryHotwordAnalyzer ───────────────────────────────────────┐
+│  1. fetch_history(N)  或复用 ui_cache 最近拉取结果               │
+│  2. for alarm in alarms:                                         │
+│       speech = alarm_to_speech(alarm, rule)                      │
+│       slots = split_slots(speech, rule)   # §5.1 槽位表          │
+│       for s in slots:                                            │
+│         t = normalize_for_cache(s)        # §5.5                 │
+│         freq[t] += 1; slot_type[t] = …                         │
+│  3. 排除 source=system 且已 ready 的固定词                       │
+│  4. Top 50 cabinet + Top 200 device → hotwords.json             │
+│  5. can_import_hotwords() 磁盘校验 §5.7.4                        │
+└────────────────────────────┬───────────────────────────────────┘
+                             ▼
+┌─ WarmupJob（可选）──────────────────────────────────────────────┐
+│  queue = [ e for e in entries if e.status == pending ]           │
+│  for text in queue:  moss_daemon.synthesize → write WAV → ready  │
+│  低优先级；实时告警合成可插队                                     │
+│  进度 → warmup_job.json → UI 进度条                               │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 热度更新
+### 6.2 拉取条数与性能参考
+
+| N | 分析耗时 | 典型新增热词 | 预合成耗时（CPU） |
+|---|----------|--------------|-----------------|
+| 100 | <2s | 10–30 | 2–8 min |
+| 500 | 3–8s | 50–100 | 10–25 min |
+| 2000 | 10–30s | 100–250 | 30–90 min |
+
+建议在 **守护进程已就绪** 且 **磁盘剩余 >20%** 时执行批量预合成。
+
+### 6.3 手动添加热词（与历史并列）
+
+| 步骤 | 说明 |
+|------|------|
+| 输入 raw | 用户输入 `NE20E-1` 或 `NE20E杠1` |
+| 规范化 | `normalize_for_cache` |
+| 写入 | `hotwords.user_words` 或 `index.entries`，`source=manual` |
+| 可选 | `WarmupJob.enqueue_single(text, priority=high)` |
+
+手动条目默认 `pinned=false`；UI 提供「置顶」防 LRU。
+
+### 6.4 热度更新与运行时补制作
 
 - 每次成功播报后，对应片段 `hit_count++`  
 - 每周或缓存满时：**LRU 淘汰** 低频片段  
-- 新设备首次出现：实时合成并 **自动加入缓存**（边用边热）
+- 新设备首次出现：实时合成并 **自动加入热词表**（`source=runtime`，边用边热）
 
-### 6.3 运维价值
+### 6.5 运维价值
 
 机房设备名相对固定，**运行一周后缓存命中率通常高于首日**。  
 适合「告警样式重复度高」的监控场景。

@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "enabled": true,
+  "char_rules": [
+    { "symbol": "-", "reading": "杠", "enabled": true },
+    { "symbol": "/", "reading": "斜杠", "enabled": false }
+  ],
+  "word_rules": [
+    { "from": "up", "to": "联通", "enabled": true },
+    { "from": "down", "to": "中断", "enabled": true }
+  ],
+  "device_patterns": [
+    {
+      "pattern": "^([A-Za-z]\\d+)_(.+)$",
+      "cabinet_suffix": "柜",
+      "enabled": true
+    }
+  ]
+}

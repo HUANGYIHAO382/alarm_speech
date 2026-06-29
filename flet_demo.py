@@ -42,12 +42,15 @@ from tts_config import (
     MOSS_DEVICE_CPU,
     MOSS_DEVICE_GPU,
     MOSS_DEVICE_LABELS,
+    get_cache_settings,
     logical_cpu_count,
     moss_cpu_threads_label,
     probe_moss_cuda_detailed,
     resolve_moss_cpu_threads,
 )
 from tts_engine import BACKEND_LOCAL, BACKEND_MOSS, BACKEND_XFYUN, get_default_engine
+from tts_play_policy import PlayPolicyConfig, PlayPolicyExecutor
+from ui_cache_panel import build_moss_cache_panel
 
 # 终端欢迎语
 WELCOME_TEXT = """告警视听助手已就绪
@@ -245,14 +248,37 @@ def main(page: ft.Page):
     page.theme_mode = ft.ThemeMode.DARK
     page.padding = 0
     page.bgcolor = C_BG
-    page.window_width = 1360
-    page.window_height = 780
+    page.window.width = 1360
+    page.window.height = 780
 
     tts = get_default_engine()
     tracker = AlarmTracker(announce_existing=False)
     poll_state = {"active": False, "interval_seconds": 30}
     event_log: list[str] = []
-    ui_cache = {"last_history_alarms": []}
+    ui_cache = {"last_history_alarms": [], "last_history_at": 0.0}
+    # 播报策略执行器（对接左栏下拉框）
+    policy_executor = PlayPolicyExecutor(PlayPolicyConfig())
+
+    def get_play_policy_config() -> PlayPolicyConfig:
+        """从 UI 控件读取当前播报策略配置。"""
+        try:
+            repeat_n = max(1, int(input_policy_repeat_n.value or "3"))
+        except ValueError:
+            repeat_n = 3
+        try:
+            cooldown = max(1, int(input_policy_cooldown.value or "120"))
+        except ValueError:
+            cooldown = 120
+        try:
+            interval = max(1, int(input_policy_interval.value or "5"))
+        except ValueError:
+            interval = 5
+        return PlayPolicyConfig(
+            policy_id=input_play_policy.value or PLAY_POLICY_ONCE,
+            repeat_n=repeat_n,
+            cooldown_seconds=cooldown,
+            interval_minutes=interval,
+        )
 
     def get_api_client() -> AlarmApiClient:
         return AlarmApiClient(input_host.value, input_token.value)
@@ -268,10 +294,25 @@ def main(page: ft.Page):
         return pid
 
     def append_console(text: str) -> None:
+        """替换终端全文（轮询刷新等大段输出）。"""
         console_output.value = text
+        console_at_bottom["value"] = True
         for line in text.strip().splitlines()[-5:]:
             if line.strip():
                 logger.info("[终端] %s", line.strip()[:500])
+
+    def append_console_line(line: str) -> None:
+        """追加一行日志；用户在底部时自动滚到底。"""
+        cur = console_output.value or ""
+        if cur and not cur.endswith("\n"):
+            cur += "\n"
+        console_output.value = cur + line + "\n"
+        if console_at_bottom["value"]:
+            try:
+                console_output.cursor_position = len(console_output.value or "")
+            except Exception:
+                pass
+        logger.info("[终端] %s", line.strip()[:500])
 
     # ---------- 连接配置 ----------
     input_host = _compact_field(ft.TextField(
@@ -353,10 +394,51 @@ def main(page: ft.Page):
     )
     moss_device_row = ft.Container(content=moss_accel_row)
 
+    # MOSS 预热：勾选后守护进程常驻内存，取消则播报结束即释放
+    input_moss_prewarm = ft.Checkbox(
+        label="启动时预热模型（常驻内存）",
+        value=tts.is_moss_prewarm_enabled(),
+        label_style=ft.TextStyle(size=CTRL_TEXT_SIZE, color=C_TEXT),
+    )
+    moss_prewarm_hint = ft.Text(
+        "勾选：后台加载模型，试听/告警更快；取消：仅工作时加载，结束后释放内存",
+        size=9,
+        color=C_TEXT_MUTED,
+    )
+    moss_prewarm_panel = ft.Column(
+        controls=[input_moss_prewarm, moss_prewarm_hint],
+        spacing=4,
+    )
+
+    # 片段拼合开关（MOSS 缓存加速）
+    input_moss_stitch = ft.Switch(
+        label="启用片段拼合（缓存加速）",
+        value=tts.is_stitch_enabled(),
+        active_color=C_SUCCESS,
+        label_style=ft.TextStyle(size=CTRL_TEXT_SIZE, color=C_TEXT),
+    )
+    moss_stitch_hint = ft.Text(
+        "开启：命中缓存片段时拼合播放（<1s）；关闭：始终整句 MOSS 合成",
+        size=9,
+        color=C_TEXT_MUTED,
+    )
+    moss_stitch_panel = ft.Column(
+        controls=[input_moss_stitch, moss_stitch_hint],
+        spacing=4,
+    )
+
+    def on_moss_stitch_change(e):
+        tts.set_stitch_enabled(bool(input_moss_stitch.value))
+        logger.info("MOSS 拼合: %s", input_moss_stitch.value)
+        page.update()
+
+    input_moss_stitch.on_change = on_moss_stitch_change
+
     moss_progress_bar = ft.ProgressBar(value=0, bar_height=5, color=C_ACCENT, bgcolor=C_BORDER)
     moss_progress_text = ft.Text("", size=10, color=C_TEXT_MUTED)
+    moss_progress_time = ft.Text("", size=10, color=C_ACCENT, weight=ft.FontWeight.W_500)
     moss_progress_panel = ft.Column(
-        controls=[moss_progress_text, moss_progress_bar],
+        controls=[moss_progress_text, moss_progress_bar, moss_progress_time],
         spacing=6,
         visible=False,
     )
@@ -465,29 +547,156 @@ def main(page: ft.Page):
         is_cpu = tts.get_moss_execution_provider() == MOSS_DEVICE_CPU
         moss_device_row.visible = is_moss
         moss_device_hint.visible = is_moss
+        moss_prewarm_panel.visible = is_moss
+        moss_stitch_panel.visible = is_moss
         moss_cpu_threads_col.visible = is_moss and is_cpu
+        if cache_panel_ref.get("panel"):
+            cache_panel_ref["panel"].visible = is_moss
         if not is_moss:
             moss_progress_panel.visible = False
+
+    def _hide_moss_progress() -> None:
+        """收起试听区的进度条（空闲态不占位）。"""
+        moss_progress_panel.visible = False
+        moss_progress_bar.value = 0
+        moss_progress_text.value = ""
+        moss_progress_time.value = ""
+
+    def _schedule_hide_moss_progress(delay: float = 3.0) -> None:
+        """完成后保留总耗时几秒，再自动收起进度条。"""
+        def _later():
+            time.sleep(delay)
+            _hide_moss_progress()
+            try:
+                page.update()
+            except Exception:
+                pass
+
+        threading.Thread(target=_later, daemon=True, name="moss-progress-hide").start()
+
+    def _format_moss_elapsed(seconds: float) -> str:
+        """把秒数格式化为易读的耗时文案。"""
+        if seconds < 60:
+            return f"{seconds:.1f} 秒"
+        minutes = int(seconds // 60)
+        secs = seconds - minutes * 60
+        return f"{minutes} 分 {secs:.1f} 秒"
+
+    def _refresh_moss_prewarm_hint() -> None:
+        """仅更新勾选框下方的小字提示，不占用试听进度条。"""
+        if not input_moss_prewarm.value:
+            moss_prewarm_hint.value = "未勾选：仅试听/告警时临时加载，结束后释放内存"
+            return
+        if tts.is_moss_daemon_ready():
+            moss_prewarm_hint.value = "模型已预热就绪，可随时播报"
+        else:
+            moss_prewarm_hint.value = "正在后台加载模型，请稍候..."
 
     def _update_moss_progress(phase: str, elapsed: float, msg: str) -> None:
         if tts.get_backend() != BACKEND_MOSS:
             return
+
+        # 预热完成：短暂展示总耗时后收起
+        if phase == "ready":
+            moss_progress_panel.visible = True
+            moss_progress_bar.value = 1.0
+            moss_progress_text.value = msg or "预热完成"
+            if elapsed > 0:
+                moss_progress_time.value = f"总耗时 {_format_moss_elapsed(elapsed)}"
+                moss_prewarm_hint.value = f"模型已预热就绪（本次加载 {_format_moss_elapsed(elapsed)}）"
+            else:
+                moss_progress_time.value = ""
+                _refresh_moss_prewarm_hint()
+            _schedule_hide_moss_progress(3.0)
+            try:
+                page.update()
+            except Exception:
+                pass
+            return
+
+        # 合成/加载进行中
         moss_progress_panel.visible = True
         if phase == "done":
             moss_progress_bar.value = 1.0
+            moss_progress_text.value = msg or "合成完成"
+            moss_progress_time.value = f"总耗时 {_format_moss_elapsed(elapsed)}"
+            _schedule_hide_moss_progress(3.0)
         elif phase in ("loading", "daemon"):
             moss_progress_bar.value = min(0.8, max(0.05, elapsed / 120.0))
+            moss_progress_text.value = msg or "加载中"
+            moss_progress_time.value = f"已用时 {_format_moss_elapsed(elapsed)}"
         elif phase == "synthesize":
             moss_progress_bar.value = min(0.95, 0.8 + elapsed / 60.0)
+            moss_progress_text.value = msg or "语音合成中"
+            moss_progress_time.value = f"已用时 {_format_moss_elapsed(elapsed)}"
         else:
             moss_progress_bar.value = min(0.9, max(0.1, elapsed / 90.0))
-        moss_progress_text.value = f"{msg}  ·  {elapsed:.1f}s"
+            moss_progress_text.value = msg or "处理中"
+            moss_progress_time.value = f"已用时 {_format_moss_elapsed(elapsed)}"
         try:
             page.update()
         except Exception:
             pass
 
     tts.set_progress_callback(_update_moss_progress)
+    tts.set_cache_summary_callback(lambda s: append_console_line(f"  [合成] {s}"))
+
+    _moss_warmup_running = False
+    cache_panel_ref: dict = {}
+
+    def _start_moss_warmup_worker() -> None:
+        """后台线程预热 MOSS，避免阻塞 Flet 界面。"""
+        nonlocal _moss_warmup_running
+        if _moss_warmup_running:
+            return
+        if tts.get_backend() != BACKEND_MOSS or not input_moss_prewarm.value:
+            return
+        if tts.is_moss_daemon_ready():
+            _refresh_moss_prewarm_hint()
+            _hide_moss_progress()
+            page.update()
+            return
+
+        _moss_warmup_running = True
+        moss_progress_panel.visible = True
+        moss_progress_text.value = "正在预热模型"
+        moss_progress_time.value = "已用时 0.0 秒"
+        moss_progress_bar.value = 0.05
+        _refresh_moss_prewarm_hint()
+        page.update()
+
+        def _worker():
+            nonlocal _moss_warmup_running
+            try:
+                err = tts.warmup_moss()
+                if err:
+                    moss_prewarm_hint.value = f"预热失败: {err}"
+                    logger.warning("MOSS 预热失败: %s", err)
+                    _hide_moss_progress()
+                else:
+                    _refresh_moss_prewarm_hint()
+                    _hide_moss_progress()
+            finally:
+                _moss_warmup_running = False
+                try:
+                    page.update()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_worker, daemon=True, name="moss-warmup").start()
+
+    def on_moss_prewarm_change(e):
+        tts.set_moss_prewarm(bool(input_moss_prewarm.value))
+        if input_moss_prewarm.value:
+            logger.info("MOSS 预热: 开启")
+            _start_moss_warmup_worker()
+        else:
+            logger.info("MOSS 预热: 关闭，已释放模型")
+            moss_progress_panel.visible = False
+            _refresh_moss_prewarm_hint()
+        page.update()
+
+    input_moss_prewarm.on_change = on_moss_prewarm_change
 
     def on_moss_device_change(e):
         err = tts.set_moss_execution_provider(input_moss_device.value)
@@ -500,11 +709,15 @@ def main(page: ft.Page):
         _sync_moss_panels()
         if input_moss_device.value == MOSS_DEVICE_CPU:
             _apply_moss_cpu_threads()
+        if input_moss_prewarm.value:
+            _start_moss_warmup_worker()
         page.update()
 
     def on_moss_cpu_threads_change(e):
         _apply_moss_cpu_threads()
         logger.info("MOSS CPU 线程: %s", tts.get_moss_cpu_threads())
+        if input_moss_prewarm.value:
+            _start_moss_warmup_worker()
         page.update()
 
     input_moss_device.on_change = on_moss_device_change
@@ -514,6 +727,10 @@ def main(page: ft.Page):
         input_moss_device.value = MOSS_DEVICE_CPU
     _apply_moss_cpu_threads()
     _sync_moss_panels()
+    _refresh_moss_prewarm_hint()
+    _hide_moss_progress()
+    if tts.get_backend() == BACKEND_MOSS and input_moss_prewarm.value:
+        _start_moss_warmup_worker()
     _sync_play_policy_panels()
 
     def _update_preview_labels() -> None:
@@ -548,11 +765,24 @@ def main(page: ft.Page):
             out += f"{'-' * 70}\n处理中...\n"
             append_console(out)
             set_status(f"试听 · {engine_label}", busy=True)
+            if tts.get_backend() == BACKEND_MOSS:
+                moss_progress_panel.visible = True
+                moss_progress_text.value = "准备合成"
+                moss_progress_time.value = "已用时 0.0 秒"
+                moss_progress_bar.value = 0.05
             page.update()
 
             err = tts.speak_preview_blocking(polished)
-            out += f"失败: {err}\n" if err else "试听完成\n"
-            moss_progress_panel.visible = False
+            total = tts.get_moss_last_elapsed()
+            if err:
+                out += f"失败: {err}\n"
+            else:
+                out += "试听完成\n"
+                if tts.get_backend() == BACKEND_MOSS and total > 0:
+                    out += f"MOSS 总耗时: {_format_moss_elapsed(total)}\n"
+            # 进度条在「总耗时」展示约 3 秒后由 _schedule_hide_moss_progress 自动收起
+            if tts.get_backend() == BACKEND_MOSS:
+                _refresh_moss_prewarm_hint()
             btn_preview.disabled = False
             append_console(out)
             set_status("待命")
@@ -573,6 +803,9 @@ def main(page: ft.Page):
         local_rate_panel.visible = tts.get_backend() == BACKEND_LOCAL
         top_tts_chip.content.value = tts.backend_label()
         _sync_moss_panels()
+        _refresh_moss_prewarm_hint()
+        if tts.get_backend() == BACKEND_MOSS and input_moss_prewarm.value:
+            _start_moss_warmup_worker()
         _update_preview_labels()
         page.update()
 
@@ -612,7 +845,10 @@ def main(page: ft.Page):
         status_dot.bgcolor = dot_color
         status_dot_bar.bgcolor = dot_color
 
-    # ---------- 终端 ----------
+    # ---------- 终端（支持垂直滚动）----------
+    console_at_bottom = {"value": True}
+
+    # TextField(multiline) 在固定高度容器内默认可滚动（本版 Flet 不支持 scroll 参数）
     console_output = ft.TextField(
         multiline=True,
         read_only=True,
@@ -624,6 +860,33 @@ def main(page: ft.Page):
         bgcolor="transparent",
         cursor_color=C_TERMINAL_TEXT,
     )
+
+    # 外包容器限制高度，防止日志撑破右栏布局（见 UI优化方案 §2.4.5 方案 A）
+    terminal_body = ft.Container(
+        content=console_output,
+        expand=True,
+        clip_behavior=ft.ClipBehavior.HARD_EDGE,
+    )
+
+    def on_console_scroll(e):
+        """用户手动滚动时暂停自动跟到底部。"""
+        try:
+            val = console_output.value or ""
+            pos = getattr(console_output, "cursor_position", None)
+            if pos is not None and val:
+                console_at_bottom["value"] = pos >= len(val) - 20
+        except Exception:
+            pass
+
+    console_output.on_change = on_console_scroll
+
+    def scroll_console_to_bottom(_e=None):
+        console_at_bottom["value"] = True
+        try:
+            console_output.cursor_position = len(console_output.value or "")
+        except Exception:
+            pass
+        page.update()
 
     def push_event_log(line: str) -> None:
         event_log.insert(0, line)
@@ -686,11 +949,18 @@ def main(page: ft.Page):
                 page.update()
                 return
             events = tracker.diff(result.data, query_by_id=client.query_by_id)
+            policy_executor.update_config(get_play_policy_config())
             for ev in events:
                 push_event_log(ev.log_line)
                 speech = event_to_speech(ev, get_speech_rule_id())
-                if speech:
-                    tts.speak(speech)
+                if speech and policy_executor.should_play(ev.alarm_id, ev.kind):
+                    is_repeat = policy_executor.is_repeat_play(ev.alarm_id)
+                    tts.speak_alarm(
+                        speech,
+                        alarm_id=ev.alarm_id,
+                        rule_id=get_speech_rule_id(),
+                        is_repeat=is_repeat,
+                    )
                     err = tts.last_error()
                     if err:
                         logger.error("播报失败: %s", err)
@@ -842,6 +1112,8 @@ def main(page: ft.Page):
             voice_dropdown_row,
             moss_device_row,
             moss_device_hint,
+            moss_prewarm_panel,
+            moss_stitch_panel,
             local_rate_panel,
             tts_hint_text,
             ft.Divider(height=1, color=C_BORDER),
@@ -926,6 +1198,12 @@ def main(page: ft.Page):
             ft.Icon(ft.Icons.TERMINAL, color=C_TEXT_MUTED, size=16),
             ft.Text("数据终端", size=13, weight=ft.FontWeight.W_600, color=C_TEXT),
             ft.Container(expand=True),
+            ft.TextButton(
+                "回到底部",
+                icon=ft.Icons.VERTICAL_ALIGN_BOTTOM,
+                on_click=scroll_console_to_bottom,
+                style=ft.ButtonStyle(color=C_TEXT_MUTED, padding=ft.padding.symmetric(horizontal=8)),
+            ),
             ft.IconButton(
                 icon=ft.Icons.DELETE_SWEEP_OUTLINED,
                 icon_size=18,
@@ -937,12 +1215,41 @@ def main(page: ft.Page):
         vertical_alignment=ft.CrossAxisAlignment.CENTER,
     )
 
+    # MOSS 预缓存面板（仅 MOSS 引擎时显示）
+    cache_panel = build_moss_cache_panel(
+        page,
+        tts_engine=tts,
+        append_console_line=append_console_line,
+        get_speech_rule_id=get_speech_rule_id,
+        ui_cache=ui_cache,
+        get_api_client=get_api_client,
+        is_moss_backend=lambda: tts.get_backend() == BACKEND_MOSS,
+    )
+    cache_panel_ref["panel"] = cache_panel
+    cache_panel_ref["refresh"] = cache_panel.data.get("refresh") if getattr(cache_panel, "data", None) else None
+
+    def _refresh_cache_panel_periodic():
+        """后台定时刷新存储条与热词表。"""
+        while True:
+            try:
+                time.sleep(30)
+                if tts.get_backend() == BACKEND_MOSS:
+                    fn = cache_panel_ref.get("refresh")
+                    if fn:
+                        fn()
+            except Exception:
+                time.sleep(30)
+
+    threading.Thread(target=_refresh_cache_panel_periodic, daemon=True, name="cache-refresh").start()
+
     right_panel = ft.Container(
         content=ft.Column(
             controls=[
                 terminal_header,
                 ft.Divider(height=1, color=C_BORDER),
-                ft.Container(content=console_output, expand=True, padding=ft.padding.all(4)),
+                ft.Container(content=terminal_body, expand=5, padding=ft.padding.all(4)),
+                ft.Divider(height=1, color=C_BORDER),
+                ft.Container(content=cache_panel, expand=4),
             ],
             expand=True,
             spacing=8,

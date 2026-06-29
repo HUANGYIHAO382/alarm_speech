@@ -9,10 +9,11 @@
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, List, Optional
 
 # ---------- 播报规则 ID (界面下拉框 value) ----------
 RULE_AUTO = "auto"
@@ -112,24 +113,75 @@ build_port_table_speech = build_port_table_speech_text
 
 def polish_speech_for_tts(text: str) -> str:
     """
-    兜底润色：处理未走标准构建函数的文本（如手动输入、旧缓存）。
-    已是标准格式的字符串将保持不变。
+    兜底润色：委托 tts_normalize.normalize_for_cache，保证与缓存 Key 一致。
     """
     if not text:
         return text
-
-    out = text.strip()
-    if re.search(r"柜，.+，端口，(联通|中断)$", out):
+    try:
+        from tts_normalize import normalize_for_cache
+        return normalize_for_cache(text)
+    except ImportError:
+        # 无 normalize 模块时的最小兜底
+        out = text.strip()
+        out = out.replace("柜的", "柜，")
+        out = re.sub(r"([A-Za-z0-9]+)-([A-Za-z0-9]+)", r"\1杠\2", out)
         return out
 
-    out = out.replace("柜的", "柜，")
-    out = re.sub(r"([A-Za-z0-9]+)-([A-Za-z0-9]+)", r"\1杠\2", out)
-    for en, cn in PORT_STATE_TTS_CN.items():
-        out = re.sub(rf"端口\s*{en}\b", f"端口，{cn}", out, flags=re.IGNORECASE)
-        out = re.sub(rf"\b{en}\b", cn, out, flags=re.IGNORECASE)
-    out = re.sub(r"[ \t]+", "", out)
-    out = re.sub(r"，{2,}", "，", out)
-    return out
+
+def speech_text_hash(text: str) -> str:
+    """整句文本 hash，供 L2 utterance 缓存 Key 使用。"""
+    norm = polish_speech_for_tts(text)
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:12]
+
+
+def split_speech_to_segments(text: str, rule_id: str = RULE_AUTO) -> Optional[List[str]]:
+    """
+    将播报文本拆为片段列表，供 L1 拼合使用。
+    端口表：B05柜，NE20E杠1，端口，联通 → 4 段
+    通用/恢复：告警，设备，标题 → 3 段
+    无法识别模板时返回 None（走整句 MOSS）。
+    """
+    if not text:
+        return None
+
+    norm = polish_speech_for_tts(text)
+    rule_id = (rule_id or RULE_AUTO).strip().lower()
+
+    # 端口表标准句式（4 段）
+    port_m = re.match(r"^(.+柜)，(.+)，端口，(联通|中断)$", norm)
+    if port_m:
+        return [port_m.group(1), port_m.group(2), "端口", port_m.group(3)]
+
+    if rule_id == RULE_PORT_TABLE:
+        return None
+
+    # 按中文逗号拆分，处理「告警/恢复 + 机柜设备 + 标题/状态」
+    parts = [p for p in norm.split("，") if p]
+    if len(parts) >= 3 and parts[0] in ("告警", "恢复"):
+        if parts[0] == "恢复" and parts[-1] == "已恢复正常":
+            if len(parts) == 3:
+                return parts
+            # 恢复，B05柜，NE20E杠1，已恢复正常 → 4 段
+            if len(parts) == 4:
+                return parts
+        if parts[0] == "告警":
+            if len(parts) == 3:
+                return parts
+            if len(parts) >= 4:
+                # 告警，B05柜，NE20E杠1，标题…
+                return [parts[0], parts[1], parts[2], "，".join(parts[3:])]
+
+    # 恢复：恢复，{设备}，已恢复正常（设备名内含逗号时整段作为第 2 段）
+    rec_m = re.match(r"^恢复，(.+)，已恢复正常$", norm)
+    if rec_m:
+        return ["恢复", rec_m.group(1), "已恢复正常"]
+
+    # 通用告警：告警，{设备}，{标题}
+    gen_m = re.match(r"^告警，(.+)，(.+)$", norm)
+    if gen_m:
+        return ["告警", gen_m.group(1), gen_m.group(2)]
+
+    return None
 
 
 def parse_last2_state(alarm: dict) -> Optional[str]:

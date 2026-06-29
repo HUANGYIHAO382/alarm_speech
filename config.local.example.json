@@ -8,13 +8,27 @@
       "prompt_audio_path": "",
       "model_dir": "",
       "cpu_threads": 4,
-      "execution_provider": "cpu"
+      "execution_provider": "cpu",
+      "prewarm": false
     },
     "xfyun": {
       "app_id": "",
       "api_key": "",
       "api_secret": "",
       "vcn": "xiaoyan"
+    }
+  },
+  "alarm_speech": {
+    "cache": {
+      "enabled": true,
+      "stitch_enabled": true,
+      "stitch_silence_ms": 80,
+      "max_disk_mb": 500,
+      "max_entries": 500,
+      "auto_lru_at_percent": 90,
+      "history_fetch_default": 500,
+      "auto_synthesize_after_history": false,
+      "panel_collapsed": false
     }
   }
 }

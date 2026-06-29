@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "description": "Tier-0 固定词：全库共用，预热后拼合命中率接近 100%",
+  "phrases": [
+    { "text": "端口", "source": "system", "slot_type": "keyword_port" },
+    { "text": "联通", "source": "system", "slot_type": "state" },
+    { "text": "中断", "source": "system", "slot_type": "state" },
+    { "text": "告警", "source": "system", "slot_type": "event" },
+    { "text": "恢复", "source": "system", "slot_type": "event" },
+    { "text": "已恢复正常", "source": "system", "slot_type": "event" }
+  ]
+}

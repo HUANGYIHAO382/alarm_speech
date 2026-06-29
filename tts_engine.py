@@ -16,11 +16,12 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from tts_config import (
     create_moss_client,
     create_xfyun_client,
+    get_cache_settings,
     get_xfyun_settings,
     is_moss_configured,
     load_merged_config,
@@ -65,7 +66,15 @@ class TTSEngine:
         self._backend_mode = default_backend_mode()
         self._moss_provider_override: Optional[str] = None
         self._moss_cpu_threads_override: Optional[int] = None
+        self._moss_prewarm_enabled = self._load_moss_prewarm_default()
         self._progress_callback: Optional[Callable[[str, float, str], None]] = None
+        # 拼合/缓存摘要回调（供终端显示）
+        self._cache_summary_callback: Optional[Callable[[str], None]] = None
+        self._stitch_enabled = bool(get_cache_settings().get("stitch_enabled", True))
+        self._planner = None
+        # MOSS 单次任务计时（预热 / 合成），供进度条与总耗时展示
+        self._moss_job_t0: Optional[float] = None
+        self._moss_last_total_seconds: float = 0.0
         # SAPI Rate 范围 -10(最慢) ~ 10(最快), 默认 -3 略慢于系统默认
         self._local_sapi_rate = -4
 
@@ -74,6 +83,20 @@ class TTSEngine:
 
     # ---------- 对外接口 ----------
     def speak(self, text: str) -> None:
+        """普通播报（无告警 ID，不走 L2）。"""
+        self.speak_alarm(text, alarm_id=None, rule_id=None, is_repeat=False)
+
+    def speak_alarm(
+        self,
+        text: str,
+        *,
+        alarm_id: Any = None,
+        rule_id: Optional[str] = None,
+        is_repeat: bool = False,
+    ) -> None:
+        """
+        告警播报：MOSS 模式下走 TtsPlaybackPlanner（拼合/L2）。
+        """
         if not text or not self._enabled:
             return
 
@@ -81,15 +104,62 @@ class TTSEngine:
         if not text:
             return
 
+        # 去重 Key：同一文本在窗口内不重复入队
+        dedup_key = f"{alarm_id}|{text}" if alarm_id is not None else text
         if self._dedup_window > 0:
             now = time.time()
             with self._lock:
-                last = self._recent.get(text, 0)
+                last = self._recent.get(dedup_key, 0)
                 if now - last < self._dedup_window:
                     return
-                self._recent[text] = now
+                self._recent[dedup_key] = now
 
-        self._queue.put(text)
+        job = ("__alarm__", text, alarm_id, rule_id, is_repeat)
+        self._queue.put(job)
+
+    def set_cache_summary_callback(self, callback: Optional[Callable[[str], None]]) -> None:
+        """设置拼合/缓存摘要回调，供 UI 终端显示。"""
+        self._cache_summary_callback = callback
+
+    def is_stitch_enabled(self) -> bool:
+        return self._stitch_enabled
+
+    def set_stitch_enabled(self, enabled: bool) -> None:
+        """开启/关闭片段拼合。"""
+        self._stitch_enabled = bool(enabled)
+        self._planner = None
+
+    def synthesize_moss_bytes(self, text: str) -> bytes:
+        """供 WarmupJob 使用的 MOSS 合成（阻塞）。"""
+        err = self._ensure_moss()
+        if err:
+            raise RuntimeError(err)
+        if self._moss_client is None:
+            raise RuntimeError("MOSS 客户端未初始化")
+        return self._moss_client.synthesize_for_playback(
+            self._prepare_text_for_tts(text),
+            progress=self._emit_moss_progress,
+        )
+
+    def _get_planner(self):
+        if self._planner is None:
+            from tts_playback_planner import TtsPlaybackPlanner
+            cfg = get_cache_settings()
+            self._planner = TtsPlaybackPlanner(
+                synthesize_fn=self.synthesize_moss_bytes,
+                stitch_enabled=self._stitch_enabled,
+                cache_enabled=cfg.get("enabled", True),
+            )
+        return self._planner
+
+    def _init_warmup_job(self) -> None:
+        """向 WarmupJob 注入 MOSS 合成函数。"""
+        try:
+            from tts_warmup_job import WarmupJob
+            job = WarmupJob.instance()
+            job.set_synthesize_fn(self.synthesize_moss_bytes)
+        except ImportError:
+            pass
 
     def speak_local(self, text: str) -> None:
         """
@@ -131,7 +201,10 @@ class TTSEngine:
                 err = self._ensure_moss()
                 if err:
                     return err
-                self._speak_moss(text)
+                try:
+                    self._speak_moss(text)
+                finally:
+                    self._maybe_release_moss_after_work()
             else:
                 local_backend, speaker, engine = self._init_local_backend()
                 self._speak_local(local_backend, speaker, engine, text)
@@ -151,6 +224,55 @@ class TTSEngine:
     ) -> None:
         """设置 MOSS 合成进度回调: (阶段, 已用秒数, 说明)。"""
         self._progress_callback = callback
+
+    def get_moss_last_elapsed(self) -> float:
+        """上一次 MOSS 任务（预热或合成）的总耗时（秒）。"""
+        return self._moss_last_total_seconds
+
+    def _begin_moss_job(self) -> None:
+        """标记 MOSS 任务开始，用于统计总耗时。"""
+        if self._moss_job_t0 is None:
+            self._moss_job_t0 = time.perf_counter()
+
+    def _moss_job_elapsed(self) -> float:
+        if self._moss_job_t0 is None:
+            return 0.0
+        return time.perf_counter() - self._moss_job_t0
+
+    def _finish_moss_job(self) -> float:
+        """结束计时并记录总耗时。"""
+        total = self._moss_job_elapsed()
+        if total > 0:
+            self._moss_last_total_seconds = total
+        self._moss_job_t0 = None
+        return total
+
+    def _emit_moss_progress(self, phase: str, step_elapsed: float, msg: str) -> None:
+        """
+        包装 MOSS 进度：统一附加「已用时 / 总耗时」。
+        phase: daemon / loading / synthesize / done / ready / ...
+        """
+        cb = self._progress_callback
+        if cb is None:
+            return
+
+        active_phases = ("daemon", "loading", "synthesize", "cli", "fallback")
+        if phase in active_phases:
+            self._begin_moss_job()
+
+        total = self._moss_job_elapsed() if self._moss_job_t0 is not None else step_elapsed
+        base_msg = (msg or "").strip()
+
+        if phase == "done":
+            total = self._finish_moss_job() or total
+            display = "合成完成"
+        elif phase == "ready":
+            total = self._finish_moss_job() or total
+            display = "预热完成" if total > 0 else (base_msg or "模型已预热就绪")
+        else:
+            display = base_msg or "处理中"
+
+        cb(phase, total, display)
 
     def set_moss_execution_provider(self, provider: str) -> str:
         """
@@ -190,6 +312,73 @@ class TTSEngine:
         from tts_config import get_moss_settings
         return int(get_moss_settings().get("cpu_threads", 4))
 
+    @staticmethod
+    def _load_moss_prewarm_default() -> bool:
+        """从 config.local.json 读取 MOSS 预热默认值。"""
+        try:
+            from tts_config import get_moss_settings
+            return bool(get_moss_settings().get("prewarm", False))
+        except Exception:
+            return False
+
+    def is_moss_prewarm_enabled(self) -> bool:
+        """是否开启 MOSS 模型常驻预热。"""
+        return self._moss_prewarm_enabled
+
+    def set_moss_prewarm(self, enabled: bool) -> str:
+        """
+        切换 MOSS 预热模式。
+        开启：模型常驻内存；关闭：立即释放守护进程。
+        """
+        self._moss_prewarm_enabled = bool(enabled)
+        if not enabled:
+            self.release_moss_memory()
+        self._last_error = ""
+        return ""
+
+    def is_moss_daemon_ready(self) -> bool:
+        """守护进程是否已加载模型（仅 MOSS 模式有意义）。"""
+        if self._moss_client is None:
+            return False
+        return self._moss_client.is_daemon_alive()
+
+    def warmup_moss(self) -> str:
+        """
+        阻塞式预热 MOSS 守护进程。
+        返回空字符串表示成功，否则为错误信息。
+        """
+        err = self._ensure_moss()
+        if err:
+            return err
+        if self._moss_client is None:
+            return "MOSS 客户端未初始化"
+        if self._moss_client.is_daemon_alive():
+            self._emit_moss_progress("ready", 0.0, "模型已预热就绪")
+            return ""
+        self._begin_moss_job()
+        try:
+            self._moss_client.warmup_daemon(progress=self._emit_moss_progress)
+            self._emit_moss_progress("ready", 0.0, "预热完成")
+            return ""
+        except Exception as err:
+            self._moss_job_t0 = None
+            self._last_error = str(err)
+            return str(err)
+
+    def release_moss_memory(self) -> None:
+        """停止守护进程并释放模型占用的内存。"""
+        if self._moss_client is not None:
+            self._moss_client.shutdown_daemon()
+            self._moss_client = None
+
+    def _maybe_release_moss_after_work(self) -> None:
+        """非预热模式下，播报结束后释放模型。"""
+        if self._moss_prewarm_enabled:
+            return
+        if self.get_backend() != BACKEND_MOSS:
+            return
+        self.release_moss_memory()
+
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = enabled
 
@@ -225,7 +414,10 @@ class TTSEngine:
             if err:
                 return err
 
+        previous_mode = self.get_backend()
         with self._mode_lock:
+            if previous_mode == BACKEND_MOSS and mode != BACKEND_MOSS:
+                self.release_moss_memory()
             self._backend_mode = mode
         self._last_error = ""
         return ""
@@ -272,6 +464,7 @@ class TTSEngine:
     def _ensure_moss(self) -> str:
         """确保 MOSS 客户端可用, 失败返回错误信息。"""
         if self._moss_client is not None:
+            self._init_warmup_job()
             return ""
         if not is_moss_configured():
             return (
@@ -291,6 +484,8 @@ class TTSEngine:
             return ""
         except Exception as err:
             return f"MOSS 初始化失败: {err}"
+        finally:
+            self._init_warmup_job()
 
     # ---------- 内部: 后台消费 ----------
     def _run(self) -> None:
@@ -301,9 +496,15 @@ class TTSEngine:
                 continue
 
             force_local = False
+            alarm_id = None
+            rule_id = None
+            is_repeat = False
+
             if isinstance(item, tuple) and len(item) == 2 and item[0] == "__force_local__":
                 force_local = True
                 text = item[1]
+            elif isinstance(item, tuple) and len(item) == 5 and item[0] == "__alarm__":
+                _, text, alarm_id, rule_id, is_repeat = item
             else:
                 text = item
 
@@ -321,7 +522,15 @@ class TTSEngine:
                         err = self._ensure_moss()
                         if err:
                             raise RuntimeError(err)
-                        self._speak_moss(text)
+                        try:
+                            self._speak_moss(
+                                text,
+                                alarm_id=alarm_id,
+                                rule_id=rule_id,
+                                is_repeat=is_repeat,
+                            )
+                        finally:
+                            self._maybe_release_moss_after_work()
                     else:
                         self._speak_local(local_backend, speaker, engine, text)
                 self._last_error = ""
@@ -349,12 +558,41 @@ class TTSEngine:
         wav_bytes = self._xfyun_client.synthesize_for_playback(text)
         self._play_wav_bytes(wav_bytes)
 
-    def _speak_moss(self, text: str) -> None:
-        wav_bytes = self._moss_client.synthesize_for_playback(
-            text,
-            progress=self._progress_callback,
-        )
-        self._play_wav_bytes(wav_bytes)
+    def _speak_moss(
+        self,
+        text: str,
+        *,
+        alarm_id: Any = None,
+        rule_id: Optional[str] = None,
+        is_repeat: bool = False,
+    ) -> None:
+        self._begin_moss_job()
+        cfg = get_cache_settings()
+        use_planner = cfg.get("enabled", True)
+
+        if use_planner:
+            planner = self._get_planner()
+            result = planner.resolve(
+                text,
+                alarm_id=alarm_id,
+                rule_id=rule_id or "auto",
+                is_repeat=is_repeat,
+                progress=self._emit_moss_progress,
+            )
+            self._play_wav_bytes(result.wav_bytes)
+            self._emit_cache_summary(result.summary)
+            if result.save_utterance and alarm_id is not None:
+                planner.save_utterance_after_play(alarm_id, result)
+        else:
+            wav_bytes = self._moss_client.synthesize_for_playback(
+                text,
+                progress=self._emit_moss_progress,
+            )
+            self._play_wav_bytes(wav_bytes)
+
+    def _emit_cache_summary(self, summary: str) -> None:
+        if summary and self._cache_summary_callback:
+            self._cache_summary_callback(summary)
 
     @staticmethod
     def _play_wav_bytes(wav_bytes: bytes) -> None:

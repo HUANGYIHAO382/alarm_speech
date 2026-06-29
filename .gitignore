@@ -33,6 +33,20 @@ build/
 Thumbs.db
 
 # ============================================
+# MOSS 语音缓存（运行时生成，勿提交 WAV）
+# ============================================
+cache/moss/
+cache/utterances/
+cache/index.json
+cache/stats.json
+cache/hotwords.json
+cache/warmup_job.json
+cache/utterance_index.json
+
+# 保留 symbol_rules.json 模板在 cache/ 目录
+!cache/symbol_rules.json
+
+# ============================================
 # 运行日志（落盘，勿提交）
 # ============================================
 logs/
